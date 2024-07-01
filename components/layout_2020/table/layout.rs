@@ -6,6 +6,7 @@ use std::ops::Range;
 
 use app_units::{Au, MAX_AU};
 use log::warn;
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use servo_arc::Arc;
 use style::computed_values::border_collapse::T as BorderCollapse;
 use style::computed_values::box_sizing::T as BoxSizing;
@@ -13,9 +14,7 @@ use style::computed_values::empty_cells::T as EmptyCells;
 use style::computed_values::visibility::T as Visibility;
 use style::logical_geometry::WritingMode;
 use style::properties::ComputedValues;
-use style::values::computed::{
-    CSSPixelLength, Length, LengthPercentage as ComputedLengthPercentage, Percentage,
-};
+use style::values::computed::{Length, LengthPercentage as ComputedLengthPercentage, Percentage};
 use style::values::generics::box_::{GenericVerticalAlign as VerticalAlign, VerticalAlignKeyword};
 use style::values::generics::length::GenericLengthPercentageOrAuto::{Auto, LengthPercentage};
 use style::Zero;
@@ -39,8 +38,8 @@ use crate::ContainingBlock;
 /// covered by spans or empty.
 struct CellLayout {
     layout: IndependentLayout,
-    padding: LogicalSides<Length>,
-    border: LogicalSides<Length>,
+    padding: LogicalSides<Au>,
+    border: LogicalSides<Au>,
     positioning_context: PositioningContext,
 }
 
@@ -54,7 +53,7 @@ impl CellLayout {
 
     /// The block size of this laid out cell including its border and padding.
     fn outer_block_size(&self) -> Au {
-        self.layout.content_block_size + (self.border.block_sum() + self.padding.block_sum()).into()
+        self.layout.content_block_size + self.border.block_sum() + self.padding.block_sum()
     }
 
     /// Whether the cell has no in-flow or out-of-flow contents, other than collapsed whitespace.
@@ -1006,94 +1005,106 @@ impl<'a> TableLayout<'a> {
         containing_block_for_table: &ContainingBlock,
         parent_positioning_context: &mut PositioningContext,
     ) {
-        for row_index in 0..self.table.slots.len() {
-            // When building the PositioningContext for this cell, we want it to have the same
-            // configuration for whatever PositioningContext the contents are ultimately added to.
-            let collect_for_nearest_positioned_ancestor = parent_positioning_context
-                .collects_for_nearest_positioned_ancestor() ||
-                self.table.rows.get(row_index).map_or(false, |row| {
-                    let row_group_collects_for_nearest_positioned_ancestor =
-                        row.group_index.map_or(false, |group_index| {
-                            self.table.row_groups[group_index]
-                                .style
+        self.cells_laid_out = self
+            .table
+            .slots
+            .par_iter()
+            .enumerate()
+            .map(|(row_index, row_slots)| {
+                // When building the PositioningContext for this cell, we want it to have the same
+                // configuration for whatever PositioningContext the contents are ultimately added to.
+                let collect_for_nearest_positioned_ancestor = parent_positioning_context
+                    .collects_for_nearest_positioned_ancestor() ||
+                    self.table.rows.get(row_index).map_or(false, |row| {
+                        let row_group_collects_for_nearest_positioned_ancestor =
+                            row.group_index.map_or(false, |group_index| {
+                                self.table.row_groups[group_index]
+                                    .style
+                                    .establishes_containing_block_for_absolute_descendants(
+                                        FragmentFlags::empty(),
+                                    )
+                            });
+                        row_group_collects_for_nearest_positioned_ancestor ||
+                            row.style
                                 .establishes_containing_block_for_absolute_descendants(
                                     FragmentFlags::empty(),
                                 )
-                        });
-                    row_group_collects_for_nearest_positioned_ancestor ||
-                        row.style
-                            .establishes_containing_block_for_absolute_descendants(
-                                FragmentFlags::empty(),
-                            )
-                });
-
-            let mut cells_laid_out_row = Vec::new();
-            let slots = &self.table.slots[row_index];
-            for (column_index, slot) in slots.iter().enumerate() {
-                let cell = match slot {
-                    TableSlot::Cell(cell) => cell,
-                    _ => {
-                        cells_laid_out_row.push(None);
-                        continue;
-                    },
-                };
-
-                let mut total_width = Au::zero();
-                for width_index in column_index..column_index + cell.colspan {
-                    total_width += self.distributed_column_widths[width_index];
-                }
-
-                let border = self
-                    .get_collapsed_borders_for_cell(
-                        cell,
-                        TableSlotCoordinates::new(column_index, row_index),
-                    )
-                    .unwrap_or_else(|| {
-                        cell.style
-                            .border_width(containing_block_for_table.style.writing_mode)
                     });
 
-                let padding = cell
-                    .style
-                    .padding(containing_block_for_table.style.writing_mode)
-                    .percentages_relative_to(self.basis_for_cell_padding_percentage.into());
-                let inline_border_padding_sum = border.inline_sum() + padding.inline_sum();
-                let mut total_width: CSSPixelLength =
-                    Length::from(total_width) - inline_border_padding_sum;
-                total_width = total_width.max(Length::zero());
+                row_slots
+                    .par_iter()
+                    .enumerate()
+                    .map(|(column_index, slot)| {
+                        let TableSlot::Cell(ref cell) = slot else {
+                            return None;
+                        };
 
-                let containing_block_for_children = ContainingBlock {
-                    inline_size: total_width.into(),
-                    block_size: AuOrAuto::Auto,
-                    style: &cell.style,
+                        let coordinates = TableSlotCoordinates::new(column_index, row_index);
+                        let border: LogicalSides<Au> = self
+                            .get_collapsed_borders_for_cell(cell, coordinates)
+                            .unwrap_or_else(|| {
+                                cell.style
+                                    .border_width(containing_block_for_table.style.writing_mode)
+                            })
+                            .into();
+
+                        let padding: LogicalSides<Au> = cell
+                            .style
+                            .padding(containing_block_for_table.style.writing_mode)
+                            .percentages_relative_to(self.basis_for_cell_padding_percentage.into())
+                            .into();
+                        let inline_border_padding_sum = border.inline_sum() + padding.inline_sum();
+
+                        let mut total_cell_width: Au = (column_index..column_index + cell.colspan)
+                            .map(|column_index| self.distributed_column_widths[column_index])
+                            .sum::<Au>() -
+                            inline_border_padding_sum;
+                        total_cell_width = total_cell_width.max(Au::zero());
+
+                        let containing_block_for_children = ContainingBlock {
+                            inline_size: total_cell_width,
+                            block_size: AuOrAuto::Auto,
+                            style: &cell.style,
+                        };
+
+                        let mut positioning_context = PositioningContext::new_for_subtree(
+                            collect_for_nearest_positioned_ancestor,
+                        );
+
+                        let layout = cell.contents.layout(
+                            layout_context,
+                            &mut positioning_context,
+                            &containing_block_for_children,
+                        );
+
+                        Some(CellLayout {
+                            layout,
+                            padding,
+                            border,
+                            positioning_context,
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Now go through all cells laid out and update the cell measure based on the size
+        // determined during layout.
+        for row_index in 0..self.table.size.height {
+            for column_index in 0..self.table.size.width {
+                let Some(layout) = &self.cells_laid_out[row_index][column_index] else {
+                    continue;
                 };
 
-                let mut positioning_context =
-                    PositioningContext::new_for_subtree(collect_for_nearest_positioned_ancestor);
-
-                let layout = cell.contents.layout(
-                    layout_context,
-                    &mut positioning_context,
-                    &containing_block_for_children,
-                );
-
                 let content_size_from_layout = ContentSizes {
-                    min_content: layout.content_block_size,
-                    max_content: layout.content_block_size,
+                    min_content: layout.layout.content_block_size,
+                    max_content: layout.layout.content_block_size,
                 };
                 self.cell_measures[row_index][column_index]
                     .block
                     .content_sizes
                     .max_assign(content_size_from_layout);
-
-                cells_laid_out_row.push(Some(CellLayout {
-                    layout,
-                    padding,
-                    border,
-                    positioning_context,
-                }));
             }
-            self.cells_laid_out.push(cells_laid_out_row);
         }
     }
 
@@ -1131,15 +1142,14 @@ impl<'a> TableLayout<'a> {
                         let border_padding_start =
                             layout.border.block_start + layout.padding.block_start;
                         let border_padding_end = layout.border.block_end + layout.padding.block_end;
-                        max_ascent.max_assign(ascent + border_padding_start.into());
+                        max_ascent.max_assign(ascent + border_padding_start);
 
                         // Only take into account the descent of this cell if doesn't span
                         // rows. The descent portion of the cell in cells that do span rows
                         // may extend into other rows.
                         if cell.rowspan == 1 {
                             max_descent.max_assign(
-                                layout.layout.content_block_size - ascent +
-                                    border_padding_end.into(),
+                                layout.layout.content_block_size - ascent + border_padding_end,
                             );
                         }
                     }
@@ -1656,8 +1666,7 @@ impl<'a> TableLayout<'a> {
             cell.rowspan,
             cell.colspan,
         );
-        row_relative_cell_rect.start_corner =
-            &row_relative_cell_rect.start_corner - &row_rect.start_corner;
+        row_relative_cell_rect.start_corner -= row_rect.start_corner;
         let mut fragment = cell.create_fragment(
             layout,
             row_relative_cell_rect,
@@ -1700,7 +1709,7 @@ impl<'a> TableLayout<'a> {
             })
         }
         if let Some(row) = row {
-            let mut rect = row_rect.clone();
+            let mut rect = *row_rect;
             rect.start_corner = LogicalVec2::zero();
             fragment.add_extra_background(ExtraBackground {
                 style: row.style.clone(),
@@ -1721,7 +1730,7 @@ impl<'a> TableLayout<'a> {
             if !column_group.is_empty() {
                 fragments.push(Fragment::Positioning(PositioningFragment::new_empty(
                     column_group.base_fragment_info,
-                    dimensions.get_column_group_rect(column_group).into(),
+                    dimensions.get_column_group_rect(column_group),
                     column_group.style.clone(),
                 )));
             }
@@ -1730,7 +1739,7 @@ impl<'a> TableLayout<'a> {
         for (column_index, column) in self.table.columns.iter().enumerate() {
             fragments.push(Fragment::Positioning(PositioningFragment::new_empty(
                 column.base_fragment_info,
-                dimensions.get_column_rect(column_index).into(),
+                dimensions.get_column_rect(column_index),
                 column.style.clone(),
             )));
         }
@@ -1826,22 +1835,19 @@ impl<'a> RowFragmentLayout<'a> {
         containing_block: &ContainingBlock,
         row_group_fragment_layout: &mut Option<RowGroupFragmentLayout>,
     ) -> BoxFragment {
-        let mut row_rect: LogicalRect<Length> = self.rect.into();
         if self.positioning_context.is_some() {
-            row_rect.start_corner += relative_adjustement(&self.row.style, containing_block);
+            self.rect.start_corner += relative_adjustement(&self.row.style, containing_block);
         }
 
         if let Some(ref row_group_layout) = row_group_fragment_layout {
-            let row_group_start_corner: LogicalVec2<Length> =
-                row_group_layout.rect.start_corner.into();
-            row_rect.start_corner -= row_group_start_corner;
+            self.rect.start_corner -= row_group_layout.rect.start_corner;
         }
 
         let mut row_fragment = BoxFragment::new(
             self.row.base_fragment_info,
             self.row.style.clone(),
             self.fragments,
-            row_rect,
+            self.rect,
             LogicalSides::zero(), /* padding */
             LogicalSides::zero(), /* border */
             LogicalSides::zero(), /* margin */
@@ -1896,16 +1902,15 @@ impl RowGroupFragmentLayout {
         table_positioning_context: &mut PositioningContext,
         containing_block: &ContainingBlock,
     ) -> BoxFragment {
-        let mut content_rect: LogicalRect<Length> = self.rect.into();
         if self.positioning_context.is_some() {
-            content_rect.start_corner += relative_adjustement(&self.style, containing_block);
+            self.rect.start_corner += relative_adjustement(&self.style, containing_block);
         }
 
         let mut row_group_fragment = BoxFragment::new(
             self.base_fragment_info,
             self.style,
             self.fragments,
-            content_rect,
+            self.rect,
             LogicalSides::zero(), /* padding */
             LogicalSides::zero(), /* border */
             LogicalSides::zero(), /* margin */
@@ -1983,12 +1988,12 @@ impl TableAndTrackDimensions {
             inline: column_dimensions.first().map_or_else(Au::zero, |v| v.0),
             block: row_dimensions.first().map_or_else(Au::zero, |v| v.0),
         };
-        let table_size = &LogicalVec2 {
+        let table_size = LogicalVec2 {
             inline: column_dimensions
                 .last()
                 .map_or(fallback_inline_size, |v| v.1),
             block: row_dimensions.last().map_or(fallback_block_size, |v| v.1),
-        } - &table_start_corner;
+        } - table_start_corner;
         let table_cells_rect = LogicalRect {
             start_corner: table_start_corner,
             size: table_size,
@@ -2011,7 +2016,7 @@ impl TableAndTrackDimensions {
     }
 
     fn get_row_rect(&self, row_index: usize) -> LogicalRect<Au> {
-        let mut row_rect = self.table_cells_rect.clone();
+        let mut row_rect = self.table_cells_rect;
         let row_dimensions = self.row_dimensions[row_index];
         row_rect.start_corner.block = row_dimensions.0;
         row_rect.size.block = row_dimensions.1 - row_dimensions.0;
@@ -2019,7 +2024,7 @@ impl TableAndTrackDimensions {
     }
 
     fn get_column_rect(&self, column_index: usize) -> LogicalRect<Au> {
-        let mut row_rect = self.table_cells_rect.clone();
+        let mut row_rect = self.table_cells_rect;
         let column_dimensions = self.column_dimensions[column_index];
         row_rect.start_corner.inline = column_dimensions.0;
         row_rect.size.inline = column_dimensions.1 - column_dimensions.0;
@@ -2031,7 +2036,7 @@ impl TableAndTrackDimensions {
             return LogicalRect::zero();
         }
 
-        let mut row_group_rect = self.table_cells_rect.clone();
+        let mut row_group_rect = self.table_cells_rect;
         let block_start = self.row_dimensions[row_group.track_range.start].0;
         let block_end = self.row_dimensions[row_group.track_range.end - 1].1;
         row_group_rect.start_corner.block = block_start;
@@ -2044,7 +2049,7 @@ impl TableAndTrackDimensions {
             return LogicalRect::zero();
         }
 
-        let mut column_group_rect = self.table_cells_rect.clone();
+        let mut column_group_rect = self.table_cells_rect;
         let inline_start = self.column_dimensions[column_group.track_range.start].0;
         let inline_end = self.column_dimensions[column_group.track_range.end - 1].1;
         column_group_rect.start_corner.inline = inline_start;
@@ -2062,10 +2067,10 @@ impl TableAndTrackDimensions {
             inline: self.column_dimensions[coordinates.x].0,
             block: self.row_dimensions[coordinates.y].0,
         };
-        let size = &LogicalVec2 {
+        let size = LogicalVec2 {
             inline: self.column_dimensions[coordinates.x + colspan - 1].1,
             block: self.row_dimensions[coordinates.y + rowspan - 1].1,
-        } - &start_corner;
+        } - start_corner;
         LogicalRect { start_corner, size }
     }
 }
@@ -2207,19 +2212,18 @@ impl TableSlotCell {
         // This must be scoped to this function because it conflicts with euclid's Zero.
         use style::Zero as StyleZero;
 
-        let cell_rect: LogicalRect<Length> = cell_rect.into();
-        let cell_content_rect = cell_rect.deflate(&(&layout.padding + &layout.border));
-        let content_block_size = layout.layout.content_block_size.into();
+        let cell_content_rect = cell_rect.deflate(&(layout.padding + layout.border));
+        let content_block_size = layout.layout.content_block_size;
         let vertical_align_offset = match self.effective_vertical_align() {
-            VerticalAlignKeyword::Top => Length::new(0.),
+            VerticalAlignKeyword::Top => Au::zero(),
             VerticalAlignKeyword::Bottom => cell_content_rect.size.block - content_block_size,
             VerticalAlignKeyword::Middle => {
                 (cell_content_rect.size.block - content_block_size).scale_by(0.5)
             },
             _ => {
-                Length::from(cell_baseline) -
+                cell_baseline -
                     (layout.padding.block_start + layout.border.block_start) -
-                    Length::from(layout.ascent())
+                    layout.ascent()
             },
         };
 
@@ -2232,9 +2236,9 @@ impl TableSlotCell {
         }
 
         // Create an `AnonymousFragment` to move the cell contents to the cell baseline.
-        let mut vertical_align_fragment_rect = cell_content_rect.clone();
+        let mut vertical_align_fragment_rect = cell_content_rect;
         vertical_align_fragment_rect.start_corner = LogicalVec2 {
-            inline: Length::new(0.),
+            inline: Au::zero(),
             block: vertical_align_offset,
         };
         let vertical_align_fragment = PositioningFragment::new_anonymous(
@@ -2263,8 +2267,8 @@ impl TableSlotCell {
             self.style.clone(),
             vec![Fragment::Positioning(vertical_align_fragment)],
             cell_content_rect,
-            layout.padding.into(),
-            layout.border.into(),
+            layout.padding,
+            layout.border,
             LogicalSides::zero(), /* margin */
             None,                 /* clearance */
             CollapsedBlockMargins::zero(),
@@ -2312,7 +2316,7 @@ fn get_outer_sizes_from_style(
 ) -> (LogicalVec2<Au>, LogicalVec2<Au>, LogicalVec2<Au>) {
     let box_sizing = style.get_position().box_sizing;
     let outer_size = |size: LogicalVec2<Au>| match box_sizing {
-        BoxSizing::ContentBox => &size + padding_border_sums,
+        BoxSizing::ContentBox => size + *padding_border_sums,
         BoxSizing::BorderBox => LogicalVec2 {
             inline: size.inline.max(padding_border_sums.inline),
             block: size.block.max(padding_border_sums.block),

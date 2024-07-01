@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::borrow::Cow;
-use std::convert::{TryFrom, TryInto};
+use std::convert::TryFrom;
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use servo_arc::Arc;
@@ -14,6 +14,7 @@ use style::str::char_is_whitespace;
 use style::values::specified::text::TextDecorationLine;
 
 use super::inline::construct::InlineFormattingContextBuilder;
+use super::inline::{InlineBox, InlineFormattingContext};
 use super::OutsideMarker;
 use crate::cell::ArcRefCell;
 use crate::context::LayoutContext;
@@ -22,7 +23,6 @@ use crate::dom_traversal::{
     Contents, NodeAndStyleInfo, NonReplacedContents, PseudoElementContentItem, TraversalHandler,
 };
 use crate::flow::float::FloatBox;
-use crate::flow::inline::{InlineFormattingContext, InlineLevelBox};
 use crate::flow::{BlockContainer, BlockFormattingContext, BlockLevelBox};
 use crate::formatting_contexts::IndependentFormattingContext;
 use crate::positioned::AbsolutelyPositionedBox;
@@ -191,6 +191,7 @@ where
     ) -> Self {
         let text_decoration_line =
             propagated_text_decoration_line | info.style.clone_text_decoration_line();
+
         BlockContainerBuilder {
             context,
             info,
@@ -214,6 +215,7 @@ where
             self.context,
             self.text_decoration_line,
             !self.have_already_seen_first_line_for_text_indent,
+            self.info.is_single_line_text_input(),
         ) {
             // There are two options here. This block was composed of both one or more inline formatting contexts
             // and child blocks OR this block was a single inline formatting context. In the latter case, we
@@ -325,9 +327,9 @@ where
                 self.finish_anonymous_table_if_needed();
 
                 match outside {
-                    DisplayOutside::Inline => box_slot.set(LayoutBox::InlineLevel(
-                        self.handle_inline_level_element(info, inside, contents),
-                    )),
+                    DisplayOutside::Inline => {
+                        self.handle_inline_level_element(info, inside, contents, box_slot)
+                    },
                     DisplayOutside::Block => {
                         let box_style = info.style.get_box();
                         // Floats and abspos cause blockification, so they only happen in this case.
@@ -399,7 +401,8 @@ where
             DisplayInside::Flow {
                 is_list_item: false,
             },
-            Contents::OfPseudoElement(contents),
+            NonReplacedContents::OfPseudoElement(contents).into(),
+            BoxSlot::dummy(),
         );
     }
 
@@ -420,12 +423,13 @@ where
         info: &NodeAndStyleInfo<Node>,
         display_inside: DisplayInside,
         contents: Contents,
-    ) -> ArcRefCell<InlineLevelBox> {
+        box_slot: BoxSlot<'dom>,
+    ) {
         let (DisplayInside::Flow { is_list_item }, false) =
             (display_inside, contents.is_replaced())
         else {
             // If this inline element is an atomic, handle it and return.
-            return self.inline_formatting_context_builder.push_atomic(
+            let atomic = self.inline_formatting_context_builder.push_atomic(
                 IndependentFormattingContext::construct(
                     self.context,
                     info,
@@ -435,12 +439,14 @@ where
                     TextDecorationLine::NONE,
                 ),
             );
+            box_slot.set(LayoutBox::InlineLevel(atomic));
+            return;
         };
 
         // Otherwise, this is just a normal inline box. Whatever happened before, all we need to do
         // before recurring is to remember this ongoing inline level box.
         self.inline_formatting_context_builder
-            .start_inline_box(info);
+            .start_inline_box(InlineBox::new(info));
 
         if is_list_item {
             if let Some(marker_contents) = crate::lists::make_marker(self.context, info) {
@@ -458,8 +464,9 @@ where
 
         self.finish_anonymous_table_if_needed();
 
-        // Finish the inline box in our IFC builder and return it for `display: contents`.
-        self.inline_formatting_context_builder.end_inline_box()
+        box_slot.set(LayoutBox::InlineBox(
+            self.inline_formatting_context_builder.end_inline_box(),
+        ));
     }
 
     fn handle_block_level_element(
@@ -487,8 +494,8 @@ where
         }
 
         let propagated_text_decoration_line = self.text_decoration_line;
-        let kind = match contents.try_into() {
-            Ok(contents) => match display_inside {
+        let kind = match contents {
+            Contents::NonReplaced(contents) => match display_inside {
                 DisplayInside::Flow { is_list_item }
                     if !info.style.establishes_block_formatting_context() =>
                 {
@@ -506,7 +513,7 @@ where
                     propagated_text_decoration_line,
                 },
             },
-            Err(contents) => {
+            Contents::Replaced(contents) => {
                 let contents = Contents::Replaced(contents);
                 BlockLevelCreator::Independent {
                     display_inside,
@@ -593,6 +600,7 @@ where
             self.context,
             self.text_decoration_line,
             !self.have_already_seen_first_line_for_text_indent,
+            self.info.is_single_line_text_input(),
         ) {
             self.push_block_level_job_for_inline_formatting_context(inline_formatting_context);
         }

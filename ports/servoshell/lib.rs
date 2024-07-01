@@ -2,9 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-// For Android, see /support/android/apk/ + /ports/jniapi/.
-#![cfg(not(target_os = "android"))]
-
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[macro_use]
 extern crate sig;
@@ -12,13 +9,18 @@ extern crate sig;
 #[cfg(test)]
 mod test;
 
+#[cfg(not(target_os = "android"))]
 mod backtrace;
 mod crash_handler;
 #[cfg(not(any(target_os = "android", target_env = "ohos")))]
 pub(crate) mod desktop;
+#[cfg(any(target_os = "android", target_env = "ohos"))]
+mod egl;
+#[cfg(not(target_os = "android"))]
 mod panic_hook;
 mod parser;
 mod prefs;
+#[cfg(not(any(target_os = "android", target_env = "ohos")))]
 mod resources;
 
 pub mod platform {
@@ -41,7 +43,7 @@ pub fn main() {
 pub fn main() {
     println!(
         "Cannot start /ports/servoshell/ on Android. \
-                Use /support/android/apk/ + /ports/jniapi/ instead"
+                Use /support/android/apk/ + `libservoshell.so` instead"
     );
 }
 

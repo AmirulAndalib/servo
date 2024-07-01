@@ -21,11 +21,12 @@ use embedder_traits::resources::{self, Resource};
 use euclid::default::{Point2D as UntypedPoint2D, Rect as UntypedRect, Size2D as UntypedSize2D};
 use euclid::{Point2D, Rect, Scale, Size2D};
 use fnv::FnvHashMap;
+use fonts::{
+    get_and_reset_text_shaping_performance_counter, FontCacheThread, FontContext,
+    FontContextWebFontMethods,
+};
+use fonts_traits::WebFontLoadFinishedCallback;
 use fxhash::{FxHashMap, FxHashSet};
-use gfx::font;
-use gfx::font_cache_thread::FontCacheThread;
-use gfx::font_context::{FontContext, FontContextWebFontMethods};
-use gfx_traits::WebFontLoadFinishedCallback;
 use histogram::Histogram;
 use ipc_channel::ipc::IpcSender;
 use layout::construct::ConstructionResult;
@@ -239,6 +240,16 @@ impl Drop for ScriptReflowResult {
             .script_join_chan
             .send(self.result.borrow_mut().take().unwrap())
             .unwrap();
+    }
+}
+
+impl Drop for LayoutThread {
+    fn drop(&mut self) {
+        let (keys, instance_keys) = self
+            .font_context
+            .collect_unused_webrender_resources(true /* all */);
+        self.webrender_api
+            .remove_unused_font_resources(keys, instance_keys)
     }
 }
 
@@ -676,14 +687,12 @@ impl LayoutThread {
 
         let locked_script_channel = Mutex::new(self.script_chan.clone());
         let pipeline_id = self.id;
-        let web_font_finished_loading_callback = move |succeeded: bool| {
-            if succeeded {
-                let _ = locked_script_channel
-                    .lock()
-                    .unwrap()
-                    .send(ConstellationControlMsg::WebFontLoaded(pipeline_id));
-            }
-        };
+        let web_font_finished_loading_callback =
+            move |succeeded: bool| {
+                let _ = locked_script_channel.lock().unwrap().send(
+                    ConstellationControlMsg::WebFontLoaded(pipeline_id, succeeded),
+                );
+            };
 
         // Find all font-face rules and notify the FontContext of them.
         // GWTODO: Need to handle unloading web fonts.
@@ -696,9 +705,10 @@ impl LayoutThread {
         );
 
         if self.debug.load_webfonts_synchronously && newly_loading_font_count > 0 {
+            // TODO: Handle failure in web font loading
             let _ = self
                 .script_chan
-                .send(ConstellationControlMsg::WebFontLoaded(self.id));
+                .send(ConstellationControlMsg::WebFontLoaded(self.id, true));
         }
     }
 
@@ -921,6 +931,12 @@ impl LayoutThread {
 
                 self.webrender_api
                     .send_display_list(compositor_info, builder.end().1);
+
+                let (keys, instance_keys) = self
+                    .font_context
+                    .collect_unused_webrender_resources(false /* all */);
+                self.webrender_api
+                    .remove_unused_font_resources(keys, instance_keys)
             },
         );
     }
@@ -1103,8 +1119,7 @@ impl LayoutThread {
                 },
             );
             // TODO(pcwalton): Measure energy usage of text shaping, perhaps?
-            let text_shaping_time =
-                font::get_and_reset_text_shaping_performance_counter() / num_threads;
+            let text_shaping_time = get_and_reset_text_shaping_performance_counter() / num_threads;
             profile_time::send_profile_data(
                 profile_time::ProfilerCategory::LayoutTextShaping,
                 self.profiler_metadata(),

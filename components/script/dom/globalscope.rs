@@ -56,8 +56,9 @@ use script_traits::{
 };
 use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
 use uuid::Uuid;
-use webgpu::WebGPUDevice;
+use webgpu::{DeviceLostReason, WebGPUDevice};
 
+use super::bindings::codegen::Bindings::WebGPUBinding::GPUDeviceLostReason;
 use super::bindings::trace::HashMapTracedValues;
 use crate::dom::bindings::cell::{DomRefCell, RefMut};
 use crate::dom::bindings::codegen::Bindings::BroadcastChannelBinding::BroadcastChannelMethods;
@@ -321,7 +322,7 @@ pub struct GlobalScope {
     gpu_id_hub: Arc<Mutex<Identities>>,
 
     /// WebGPU devices
-    gpu_devices: DomRefCell<HashMapTracedValues<WebGPUDevice, Dom<GPUDevice>>>,
+    gpu_devices: DomRefCell<HashMapTracedValues<WebGPUDevice, WeakRef<GPUDevice>>>,
 
     // https://w3c.github.io/performance-timeline/#supportedentrytypes-attribute
     #[ignore_malloc_size_of = "mozjs"]
@@ -3090,19 +3091,46 @@ impl GlobalScope {
     pub fn add_gpu_device(&self, device: &GPUDevice) {
         self.gpu_devices
             .borrow_mut()
-            .insert(device.id(), Dom::from_ref(device));
+            .insert(device.id(), WeakRef::new(device));
     }
 
     pub fn remove_gpu_device(&self, device: WebGPUDevice) {
-        let _ = self.gpu_devices.borrow_mut().remove(&device);
+        let device = self
+            .gpu_devices
+            .borrow_mut()
+            .remove(&device)
+            .expect("GPUDevice should still be in devices hashmap");
+        assert!(device.root().is_none())
+    }
+
+    pub fn gpu_device_lost(&self, device: WebGPUDevice, reason: DeviceLostReason, msg: String) {
+        let reason = match reason {
+            DeviceLostReason::Unknown => GPUDeviceLostReason::Unknown,
+            DeviceLostReason::Destroyed => GPUDeviceLostReason::Destroyed,
+        };
+        let _ac = enter_realm(&*self);
+        if let Some(device) = self
+            .gpu_devices
+            .borrow_mut()
+            .get_mut(&device)
+            .expect("GPUDevice should still be in devices hashmap")
+            .root()
+        {
+            device.lose(reason, msg);
+        }
     }
 
     pub fn handle_uncaptured_gpu_error(&self, device: WebGPUDevice, error: webgpu::Error) {
-        self.gpu_devices
+        if let Some(gpu_device) = self
+            .gpu_devices
             .borrow()
             .get(&device)
-            .expect("GPUDevice not found")
-            .fire_uncaptured_error(error);
+            .and_then(|device| device.root())
+        {
+            gpu_device.fire_uncaptured_error(error);
+        } else {
+            warn!("Recived error for lost GPUDevice!")
+        }
     }
 
     pub fn handle_gamepad_event(&self, gamepad_event: GamepadEvent) {

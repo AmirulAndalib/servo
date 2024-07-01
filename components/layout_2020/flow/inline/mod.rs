@@ -79,8 +79,7 @@ use std::mem;
 use app_units::Au;
 use bitflags::bitflags;
 use construct::InlineFormattingContextBuilder;
-use gfx::font::FontMetrics;
-use gfx::text::glyph::GlyphStore;
+use fonts::{FontMetrics, GlyphStore};
 use line::{
     layout_line_items, AbsolutelyPositionedLineItem, AtomicLineItem, FloatLineItem,
     InlineBoxLineItem, LineItem, LineItemLayoutState, LineMetrics, TextRunLineItem,
@@ -131,7 +130,15 @@ static FONT_SUPERSCRIPT_OFFSET_RATIO: f32 = 0.34;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct InlineFormattingContext {
-    pub(super) inline_level_boxes: Vec<ArcRefCell<InlineLevelBox>>,
+    /// All [`InlineItem`]s in this [`InlineFormattingContext`] stored in a flat array.
+    /// [`InlineItem::StartInlineBox`] and [`InlineItem::EndInlineBox`] allow representing
+    /// the tree of inline boxes within the formatting context, but a flat array allows
+    /// easy iteration through all inline items.
+    pub(super) inline_items: Vec<ArcRefCell<InlineItem>>,
+
+    /// The tree of inline boxes in this [`InlineFormattingContext`]. These are stored in
+    /// a flat array with each being given a [`InlineBoxIdentifier`].
+    pub(super) inline_boxes: InlineBoxes,
 
     /// The text content of this inline formatting context.
     pub(super) text_content: String,
@@ -148,6 +155,9 @@ pub(crate) struct InlineFormattingContext {
 
     /// Whether or not this [`InlineFormattingContext`] contains floats.
     pub(super) contains_floats: bool,
+
+    /// Whether or not this is an inline formatting context for a single line text input.
+    pub(super) is_single_line_text_input: bool,
 }
 
 /// A collection of data used to cache [`FontMetrics`] in the [`InlineFormattingContext`]
@@ -159,8 +169,9 @@ pub(crate) struct FontKeyAndMetrics {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) enum InlineLevelBox {
-    InlineBox(InlineBox),
+pub(crate) enum InlineItem {
+    StartInlineBox(InlineBoxIdentifier),
+    EndInlineBox,
     TextRun(TextRun),
     OutOfFlowAbsolutelyPositionedBox(ArcRefCell<AbsolutelyPositionedBox>),
     OutOfFlowFloatBox(FloatBox),
@@ -172,9 +183,10 @@ pub(crate) struct InlineBox {
     pub base_fragment_info: BaseFragmentInfo,
     #[serde(skip_serializing)]
     pub style: Arc<ComputedValues>,
+    /// The identifier of this inline box in the containing [`InlineFormattingContext`].
+    identifier: InlineBoxIdentifier,
     pub is_first_fragment: bool,
     pub is_last_fragment: bool,
-    pub children: Vec<ArcRefCell<InlineLevelBox>>,
     /// The index of the default font in the [`InlineFormattingContext`]'s font metrics store.
     /// This is initialized during IFC shaping.
     pub default_font_index: Option<usize>,
@@ -185,21 +197,19 @@ impl InlineBox {
         Self {
             base_fragment_info: info.into(),
             style: info.style.clone(),
+            identifier: InlineBoxIdentifier::root(),
             is_first_fragment: true,
             is_last_fragment: false,
-            children: vec![],
             default_font_index: None,
         }
     }
 
     pub(crate) fn split_around_block(&self) -> Self {
         Self {
-            base_fragment_info: self.base_fragment_info,
             style: self.style.clone(),
             is_first_fragment: false,
             is_last_fragment: false,
-            children: vec![],
-            default_font_index: None,
+            ..*self
         }
     }
 }
@@ -371,13 +381,13 @@ impl LineBlockSizes {
         }
     }
 
-    fn resolve(&self) -> Length {
+    fn resolve(&self) -> Au {
         let height_from_ascent_and_descent = self
             .baseline_relative_size_for_line_height
             .as_ref()
             .map(|size| (size.ascent + size.descent).abs())
             .unwrap_or_else(Au::zero);
-        self.line_height.max(height_from_ascent_and_descent.into())
+        Au::from(self.line_height).max(height_from_ascent_and_descent)
     }
 
     fn max(&self, other: &LineBlockSizes) -> LineBlockSizes {
@@ -421,7 +431,7 @@ impl LineBlockSizes {
             None => {
                 // This is the case mentinoned above where there are multiple solutions.
                 // This code is putting the baseline roughly in the middle of the line.
-                let leading = Au::from(self.resolve()) -
+                let leading = self.resolve() -
                     (self.size_for_baseline_positioning.ascent +
                         self.size_for_baseline_positioning.descent);
                 leading.scale_by(0.5) + self.size_for_baseline_positioning.ascent
@@ -567,9 +577,19 @@ impl UnbreakableSegmentUnderConstruction {
     }
 }
 
+bitflags! {
+    pub struct InlineContainerStateFlags: u8 {
+        const CREATE_STRUT = 0b0001;
+        const IS_SINGLE_LINE_TEXT_INPUT = 0b0010;
+    }
+}
+
 struct InlineContainerState {
     /// The style of this inline container.
     style: Arc<ComputedValues>,
+
+    /// Flags which describe details of this [`InlineContainerState`].
+    flags: InlineContainerStateFlags,
 
     /// Whether or not we have processed any content (an atomic element or text) for
     /// this inline box on the current line OR any previous line.
@@ -771,18 +791,6 @@ impl<'a, 'b> InlineFormattingContextState<'a, 'b> {
                 .map(|index| &self.fonts[index].metrics),
         );
 
-        if inline_box.is_first_fragment {
-            self.current_line.inline_position += Length::from(
-                inline_box_state.pbm.padding.inline_start +
-                    inline_box_state.pbm.border.inline_start,
-            ) + inline_box_state
-                .pbm
-                .margin
-                .inline_start
-                .auto_is(Au::zero)
-                .into()
-        }
-
         // If we are starting a `<br>` element prepare to clear after its deferred linebreak has been
         // processed. Note that a `<br>` is composed of the element itself and the inner pseudo-element
         // with the actual linebreak. Both will have this `FragmentFlag`; that's why this code only
@@ -794,6 +802,18 @@ impl<'a, 'b> InlineFormattingContextState<'a, 'b> {
             self.deferred_br_clear == Clear::None
         {
             self.deferred_br_clear = inline_box_state.base.style.clone_clear();
+        }
+
+        if inline_box.is_first_fragment {
+            self.current_line_segment.inline_size += Length::from(
+                inline_box_state.pbm.padding.inline_start +
+                    inline_box_state.pbm.border.inline_start,
+            ) + inline_box_state
+                .pbm
+                .margin
+                .inline_start
+                .auto_is(Au::zero)
+                .into()
         }
 
         let line_item = inline_box_state
@@ -880,7 +900,7 @@ impl<'a, 'b> InlineFormattingContextState<'a, 'b> {
             LineBlockSizes::zero()
         };
 
-        let resolved_block_advance = effective_block_advance.resolve().into();
+        let resolved_block_advance = effective_block_advance.resolve();
         let mut block_end_position = block_start_position + resolved_block_advance;
         if let Some(sequential_layout_state) = self.sequential_layout_state.as_mut() {
             // This amount includes both the block size of the line and any extra space
@@ -922,7 +942,7 @@ impl<'a, 'b> InlineFormattingContextState<'a, 'b> {
             justification_adjustment,
             line_metrics: &LineMetrics {
                 block_offset: block_start_position.into(),
-                block_size: effective_block_advance.resolve(),
+                block_size: effective_block_advance.resolve().into(),
                 baseline_block_offset: baseline_offset,
             },
         };
@@ -953,11 +973,11 @@ impl<'a, 'b> InlineFormattingContextState<'a, 'b> {
             // the inline start of the line in `calculate_inline_start_for_current_line` so
             // we do not need to include it in the `start_corner` of the line's main Fragment.
             start_corner: LogicalVec2 {
-                inline: Length::zero(),
-                block: block_start_position.into(),
+                inline: Au::zero(),
+                block: block_start_position,
             },
             size: LogicalVec2 {
-                inline: self.containing_block.inline_size.into(),
+                inline: self.containing_block.inline_size,
                 block: effective_block_advance.resolve(),
             },
         };
@@ -1114,8 +1134,8 @@ impl<'a, 'b> InlineFormattingContextState<'a, 'b> {
         let margin_box = float_item
             .fragment
             .border_rect()
-            .inflate(&float_item.fragment.margin.map(|t| (*t).into()));
-        let inline_size = margin_box.size.inline.max(Length::zero());
+            .inflate(&float_item.fragment.margin);
+        let inline_size = margin_box.size.inline.max(Au::zero());
 
         let available_inline_size = match self.current_line.placement_among_floats.get() {
             Some(placement_among_floats) => placement_among_floats.size.inline,
@@ -1128,7 +1148,7 @@ impl<'a, 'b> InlineFormattingContextState<'a, 'b> {
         // parenting in their stacking contexts). Once all the line content is gathered we
         // will place them later.
         let has_content = self.current_line.has_content || self.current_line_segment.has_content;
-        let fits_on_line = !has_content || inline_size <= available_inline_size;
+        let fits_on_line = !has_content || inline_size <= available_inline_size.into();
         let needs_placement_later =
             self.current_line.has_floats_waiting_to_be_placed || !fits_on_line;
 
@@ -1145,7 +1165,7 @@ impl<'a, 'b> InlineFormattingContextState<'a, 'b> {
         // start position.
         let new_placement = self.place_line_among_floats(&LogicalVec2 {
             inline: line_inline_size_without_trailing_whitespace,
-            block: self.current_line.max_block_size.resolve(),
+            block: self.current_line.max_block_size.resolve().into(),
         });
         self.current_line
             .replace_placement_among_floats(new_placement);
@@ -1186,7 +1206,7 @@ impl<'a, 'b> InlineFormattingContextState<'a, 'b> {
         );
 
         let mut placement_rect = placement.place();
-        placement_rect.start_corner = &placement_rect.start_corner - &ifc_offset_in_float_container;
+        placement_rect.start_corner -= ifc_offset_in_float_container;
         placement_rect.into()
     }
 
@@ -1452,7 +1472,8 @@ impl<'a, 'b> InlineFormattingContextState<'a, 'b> {
             block: self
                 .current_line_max_block_size_including_nested_containers()
                 .max(&self.current_line_segment.max_block_size)
-                .resolve(),
+                .resolve()
+                .into(),
         };
 
         if self.new_potential_line_size_causes_line_break(&potential_line_size) {
@@ -1500,7 +1521,7 @@ impl<'a, 'b> InlineFormattingContextState<'a, 'b> {
         if self.current_line.line_items.is_empty() {
             let will_break = self.new_potential_line_size_causes_line_break(&LogicalVec2 {
                 inline: line_inline_size_without_trailing_whitespace,
-                block: self.current_line_segment.max_block_size.resolve(),
+                block: self.current_line_segment.max_block_size.resolve().into(),
             });
             assert!(!will_break);
         }
@@ -1570,119 +1591,53 @@ impl From<&InheritedText> for SegmentContentFlags {
     }
 }
 
-enum InlineFormattingContextIterItem<'a> {
-    Item(&'a mut InlineLevelBox),
-    EndInlineBox,
-}
-
 impl InlineFormattingContext {
     pub(super) fn new_with_builder(
         builder: InlineFormattingContextBuilder,
         layout_context: &LayoutContext,
         text_decoration_line: TextDecorationLine,
         has_first_formatted_line: bool,
+        is_single_line_text_input: bool,
     ) -> Self {
-        let mut inline_formatting_context = InlineFormattingContext {
-            text_content: String::new(),
-            inline_level_boxes: builder.root_inline_boxes,
-            font_metrics: Vec::new(),
-            text_decoration_line,
-            has_first_formatted_line,
-            contains_floats: builder.contains_floats,
-        };
-
         // This is to prevent a double borrow.
         let text_content: String = builder.text_segments.into_iter().collect();
         let mut font_metrics = Vec::new();
 
         let mut new_linebreaker = LineBreaker::new(text_content.as_str());
-        inline_formatting_context.foreach(|iter_item| match iter_item {
-            InlineFormattingContextIterItem::Item(InlineLevelBox::TextRun(ref mut text_run)) => {
-                text_run.segment_and_shape(
-                    &text_content,
-                    &layout_context.font_context,
-                    &mut new_linebreaker,
-                    &mut font_metrics,
-                );
-            },
-            InlineFormattingContextIterItem::Item(InlineLevelBox::InlineBox(inline_box)) => {
-                if let Some(font) = get_font_for_first_font_for_style(
-                    &inline_box.style,
-                    &layout_context.font_context,
-                ) {
-                    inline_box.default_font_index = Some(add_or_get_font(&font, &mut font_metrics));
-                }
-            },
-            InlineFormattingContextIterItem::Item(InlineLevelBox::Atomic(_)) => {},
-            _ => {},
-        });
-
-        inline_formatting_context.text_content = text_content;
-        inline_formatting_context.font_metrics = font_metrics;
-
-        inline_formatting_context
-    }
-
-    fn foreach(&self, mut func: impl FnMut(InlineFormattingContextIterItem)) {
-        // TODO(mrobinson): Using OwnedRef here we could maybe avoid the second borrow when
-        // iterating through members of each inline box.
-        struct InlineFormattingContextChildBoxIter {
-            inline_level_box: ArcRefCell<InlineLevelBox>,
-            next_child_index: usize,
-        }
-
-        impl InlineFormattingContextChildBoxIter {
-            fn next(&mut self) -> Option<ArcRefCell<InlineLevelBox>> {
-                let borrowed_item = self.inline_level_box.borrow();
-                let inline_box = match *borrowed_item {
-                    InlineLevelBox::InlineBox(ref inline_box) => inline_box,
-                    _ => unreachable!(
-                        "InlineFormattingContextChildBoxIter created for non-InlineBox."
-                    ),
-                };
-
-                let item = inline_box.children.get(self.next_child_index).cloned();
-                if item.is_some() {
-                    self.next_child_index += 1;
-                }
-                item
+        for item in builder.inline_items.iter() {
+            match &mut *item.borrow_mut() {
+                InlineItem::TextRun(ref mut text_run) => {
+                    text_run.segment_and_shape(
+                        &text_content,
+                        &layout_context.font_context,
+                        &mut new_linebreaker,
+                        &mut font_metrics,
+                    );
+                },
+                InlineItem::StartInlineBox(identifier) => {
+                    let inline_box = builder.inline_boxes.get(identifier);
+                    let inline_box = &mut *inline_box.borrow_mut();
+                    if let Some(font) = get_font_for_first_font_for_style(
+                        &inline_box.style,
+                        &layout_context.font_context,
+                    ) {
+                        inline_box.default_font_index =
+                            Some(add_or_get_font(&font, &mut font_metrics));
+                    }
+                },
+                _ => {},
             }
         }
 
-        let mut inline_box_iterator_stack: Vec<InlineFormattingContextChildBoxIter> = Vec::new();
-        let mut root_iterator = self.inline_level_boxes.iter();
-        loop {
-            let mut item = None;
-
-            // First try to get the next item in the current inline box.
-            if !inline_box_iterator_stack.is_empty() {
-                item = inline_box_iterator_stack
-                    .last_mut()
-                    .and_then(|iter| iter.next());
-                if item.is_none() {
-                    func(InlineFormattingContextIterItem::EndInlineBox);
-                    inline_box_iterator_stack.pop();
-                    continue;
-                }
-            }
-
-            // If there is no current inline box, then try to get the next item from the root of the IFC.
-            item = item.or_else(|| root_iterator.next().cloned());
-
-            // If there is no item left, we are done iterating.
-            let item = match item {
-                Some(item) => item,
-                None => return,
-            };
-
-            let borrowed_item = &mut *item.borrow_mut();
-            func(InlineFormattingContextIterItem::Item(borrowed_item));
-            if matches!(borrowed_item, InlineLevelBox::InlineBox(_)) {
-                inline_box_iterator_stack.push(InlineFormattingContextChildBoxIter {
-                    inline_level_box: item.clone(),
-                    next_child_index: 0,
-                })
-            }
+        InlineFormattingContext {
+            text_content,
+            inline_items: builder.inline_items,
+            inline_boxes: builder.inline_boxes,
+            font_metrics,
+            text_decoration_line,
+            has_first_formatted_line,
+            contains_floats: builder.contains_floats,
+            is_single_line_text_input,
         }
     }
 
@@ -1726,6 +1681,15 @@ impl InlineFormattingContext {
                 .map(|font| font.metrics.clone());
 
         let style_text = containing_block.style.get_inherited_text();
+        let mut inline_container_state_flags = InlineContainerStateFlags::empty();
+        if inline_container_needs_strut(style, layout_context, None) {
+            inline_container_state_flags.insert(InlineContainerStateFlags::CREATE_STRUT);
+        }
+        if self.is_single_line_text_input {
+            inline_container_state_flags
+                .insert(InlineContainerStateFlags::IS_SINGLE_LINE_TEXT_INPUT);
+        }
+
         let mut ifc = InlineFormattingContextState {
             positioning_context,
             containing_block,
@@ -1739,10 +1703,10 @@ impl InlineFormattingContext {
             }),
             root_nesting_level: InlineContainerState::new(
                 style.to_arc(),
+                inline_container_state_flags,
                 None, /* parent_container */
                 self.text_decoration_line,
                 default_font_metrics.as_ref(),
-                inline_container_needs_strut(style, layout_context, None),
             ),
             inline_box_state_stack: Vec::new(),
             current_line_segment: UnbreakableSegmentUnderConstruction::new(),
@@ -1764,35 +1728,35 @@ impl InlineFormattingContext {
             // FIXME(mrobinson): Collapse margins in the containing block offsets as well??
         }
 
-        self.foreach(|item| match item {
-            InlineFormattingContextIterItem::Item(item) => {
-                // Any new box should flush a pending hard line break.
-                ifc.possibly_flush_deferred_forced_line_break();
+        for item in self.inline_items.iter() {
+            let item = &mut *item.borrow_mut();
 
-                match item {
-                    InlineLevelBox::InlineBox(ref inline_box) => {
-                        ifc.start_inline_box(inline_box);
-                    },
-                    InlineLevelBox::TextRun(ref run) => run.layout_into_line_items(&mut ifc),
-                    InlineLevelBox::Atomic(ref mut atomic_formatting_context) => {
-                        atomic_formatting_context.layout_into_line_items(layout_context, &mut ifc);
-                    },
-                    InlineLevelBox::OutOfFlowAbsolutelyPositionedBox(ref positioned_box) => {
-                        ifc.push_line_item_to_unbreakable_segment(LineItem::AbsolutelyPositioned(
-                            AbsolutelyPositionedLineItem {
-                                absolutely_positioned_box: positioned_box.clone(),
-                            },
-                        ));
-                    },
-                    InlineLevelBox::OutOfFlowFloatBox(ref mut float_box) => {
-                        float_box.layout_into_line_items(layout_context, &mut ifc);
-                    },
-                }
-            },
-            InlineFormattingContextIterItem::EndInlineBox => {
-                ifc.finish_inline_box();
-            },
-        });
+            // Any new box should flush a pending hard line break.
+            if !matches!(item, InlineItem::EndInlineBox) {
+                ifc.possibly_flush_deferred_forced_line_break();
+            }
+
+            match item {
+                InlineItem::StartInlineBox(identifier) => {
+                    ifc.start_inline_box(&*self.inline_boxes.get(identifier).borrow());
+                },
+                InlineItem::EndInlineBox => ifc.finish_inline_box(),
+                InlineItem::TextRun(run) => run.layout_into_line_items(&mut ifc),
+                InlineItem::Atomic(atomic_formatting_context) => {
+                    atomic_formatting_context.layout_into_line_items(layout_context, &mut ifc);
+                },
+                InlineItem::OutOfFlowAbsolutelyPositionedBox(positioned_box) => {
+                    ifc.push_line_item_to_unbreakable_segment(LineItem::AbsolutelyPositioned(
+                        AbsolutelyPositionedLineItem {
+                            absolutely_positioned_box: positioned_box.clone(),
+                        },
+                    ));
+                },
+                InlineItem::OutOfFlowFloatBox(ref mut float_box) => {
+                    float_box.layout_into_line_items(layout_context, &mut ifc);
+                },
+            }
+        }
 
         ifc.finish_last_line();
 
@@ -1814,14 +1778,18 @@ impl InlineFormattingContext {
 impl InlineContainerState {
     fn new(
         style: Arc<ComputedValues>,
+        flags: InlineContainerStateFlags,
         parent_container: Option<&InlineContainerState>,
         parent_text_decoration_line: TextDecorationLine,
         font_metrics: Option<&FontMetrics>,
-        create_strut: bool,
     ) -> Self {
         let text_decoration_line = parent_text_decoration_line | style.clone_text_decoration_line();
         let font_metrics = font_metrics.cloned().unwrap_or_else(FontMetrics::empty);
-        let line_height = line_height(&style, &font_metrics);
+        let line_height = line_height(
+            &style,
+            &font_metrics,
+            flags.contains(InlineContainerStateFlags::IS_SINGLE_LINE_TEXT_INPUT),
+        );
 
         let mut baseline_offset = Au::zero();
         let mut strut_block_sizes = Self::get_block_sizes_with_style(
@@ -1844,12 +1812,13 @@ impl InlineContainerState {
         let mut nested_block_sizes = parent_container
             .map(|container| container.nested_strut_block_sizes.clone())
             .unwrap_or_else(LineBlockSizes::zero);
-        if create_strut {
+        if flags.contains(InlineContainerStateFlags::CREATE_STRUT) {
             nested_block_sizes.max_assign(&strut_block_sizes);
         }
 
         Self {
             style,
+            flags,
             has_content: false,
             text_decoration_line,
             nested_strut_block_sizes: nested_block_sizes,
@@ -1938,7 +1907,12 @@ impl InlineContainerState {
             &self.style,
             font_metrics,
             font_metrics_of_first_font,
-            line_height(&self.style, font_metrics),
+            line_height(
+                &self.style,
+                font_metrics,
+                self.flags
+                    .contains(InlineContainerStateFlags::IS_SINGLE_LINE_TEXT_INPUT),
+            ),
         )
     }
 
@@ -1965,13 +1939,13 @@ impl InlineContainerState {
                     block_size
                         .resolve()
                         .scale_by(FONT_SUBSCRIPT_OFFSET_RATIO)
-                        .px(),
+                        .to_f32_px(),
                 ),
                 VerticalAlign::Keyword(VerticalAlignKeyword::Super) => -Au::from_f32_px(
                     block_size
                         .resolve()
                         .scale_by(FONT_SUPERSCRIPT_OFFSET_RATIO)
-                        .px(),
+                        .to_f32_px(),
                 ),
                 VerticalAlign::Keyword(VerticalAlignKeyword::TextTop) => {
                     child_block_size.size_for_baseline_positioning.ascent - self.font_metrics.ascent
@@ -2006,14 +1980,19 @@ impl InlineBoxContainerState {
     ) -> Self {
         let style = inline_box.style.clone();
         let pbm = style.padding_border_margin(containing_block);
-        let create_strut = inline_container_needs_strut(&style, layout_context, Some(&pbm));
+
+        let mut flags = InlineContainerStateFlags::empty();
+        if inline_container_needs_strut(&style, layout_context, Some(&pbm)) {
+            flags.insert(InlineContainerStateFlags::CREATE_STRUT);
+        }
+
         Self {
             base: InlineContainerState::new(
                 style,
+                flags,
                 Some(parent_container),
                 parent_container.text_decoration_line,
                 font_metrics,
-                create_strut,
             ),
             base_fragment_info: inline_box.base_fragment_info,
             pbm,
@@ -2047,7 +2026,7 @@ impl IndependentFormattingContext {
         let style = self.style();
         let pbm = style.padding_border_margin(ifc.containing_block);
         let margin = pbm.margin.auto_is(Au::zero);
-        let pbm_sums = &(&pbm.padding + &pbm.border) + &margin.clone();
+        let pbm_sums = pbm.padding + pbm.border + margin;
         let mut child_positioning_context = None;
 
         // We need to know the inline size of the atomic before deciding whether to do the line break.
@@ -2069,7 +2048,7 @@ impl IndependentFormattingContext {
                     replaced.base_fragment_info,
                     replaced.style.clone(),
                     fragments,
-                    content_rect.into(),
+                    content_rect,
                     pbm.padding,
                     pbm.border,
                     margin,
@@ -2158,7 +2137,7 @@ impl IndependentFormattingContext {
                     non_replaced.base_fragment_info,
                     non_replaced.style.clone(),
                     independent_layout.fragments,
-                    content_rect.into(),
+                    content_rect,
                     pbm.padding,
                     pbm.border,
                     margin,
@@ -2177,17 +2156,17 @@ impl IndependentFormattingContext {
             ifc.process_soft_wrap_opportunity();
         }
 
-        let size = &pbm_sums.sum().into() + &fragment.content_rect.size;
+        let size = pbm_sums.sum() + fragment.content_rect.size;
         let baseline_offset = self
             .pick_baseline(&fragment.baselines)
             .map(|baseline| pbm_sums.block_start + baseline)
-            .unwrap_or(size.block.into());
+            .unwrap_or(size.block);
 
         let (block_sizes, baseline_offset_in_parent) =
-            self.get_block_sizes_and_baseline_offset(ifc, size.block, baseline_offset);
+            self.get_block_sizes_and_baseline_offset(ifc, size.block.into(), baseline_offset);
         ifc.update_unbreakable_segment_for_new_content(
             &block_sizes,
-            size.inline,
+            size.inline.into(),
             SegmentContentFlags::empty(),
         );
         ifc.push_line_item_to_unbreakable_segment(LineItem::Atomic(AtomicLineItem {
@@ -2283,14 +2262,26 @@ fn place_pending_floats(ifc: &mut InlineFormattingContextState, line_items: &mut
     }
 }
 
-fn line_height(parent_style: &ComputedValues, font_metrics: &FontMetrics) -> Length {
+fn line_height(
+    parent_style: &ComputedValues,
+    font_metrics: &FontMetrics,
+    is_single_line_text_input: bool,
+) -> Length {
     let font = parent_style.get_font();
     let font_size = font.font_size.computed_size();
-    match font.line_height {
+    let mut line_height = match font.line_height {
         LineHeight::Normal => Length::from(font_metrics.line_gap),
         LineHeight::Number(number) => font_size * number.0,
         LineHeight::Length(length) => length.0,
+    };
+
+    // Single line text inputs line height is clamped to the size of `normal`. See
+    // <https://github.com/whatwg/html/pull/5462>.
+    if is_single_line_text_input {
+        line_height.max_assign(font_metrics.line_gap.into());
     }
+
+    line_height
 }
 
 fn effective_vertical_align(
@@ -2377,11 +2368,26 @@ struct ContentSizesComputation<'a> {
 
 impl<'a> ContentSizesComputation<'a> {
     fn traverse(mut self, inline_formatting_context: &InlineFormattingContext) -> ContentSizes {
-        inline_formatting_context.foreach(|iter_item| match iter_item {
-            InlineFormattingContextIterItem::Item(InlineLevelBox::InlineBox(inline_box)) => {
+        for inline_item in inline_formatting_context.inline_items.iter() {
+            self.process_item(&mut *inline_item.borrow_mut(), inline_formatting_context);
+        }
+
+        self.forced_line_break();
+        self.paragraph
+    }
+
+    fn process_item(
+        &mut self,
+        inline_item: &mut InlineItem,
+        inline_formatting_context: &InlineFormattingContext,
+    ) {
+        match inline_item {
+            InlineItem::StartInlineBox(identifier) => {
                 // For margins and paddings, a cyclic percentage is resolved against zero
                 // for determining intrinsic size contributions.
                 // https://drafts.csswg.org/css-sizing-3/#min-percentage-contribution
+                let inline_box = inline_formatting_context.inline_boxes.get(identifier);
+                let inline_box = inline_box.borrow();
                 let zero = Length::zero();
                 let padding = inline_box
                     .style
@@ -2396,7 +2402,7 @@ impl<'a> ContentSizesComputation<'a> {
                     .percentages_relative_to(zero)
                     .auto_is(Length::zero);
 
-                let pbm = &(&margin + &padding) + &border;
+                let pbm = margin + padding + border;
                 if inline_box.is_first_fragment {
                     self.add_length(pbm.inline_start);
                 }
@@ -2406,14 +2412,14 @@ impl<'a> ContentSizesComputation<'a> {
                     self.ending_inline_pbm_stack.push(Length::zero());
                 }
             },
-            InlineFormattingContextIterItem::EndInlineBox => {
+            InlineItem::EndInlineBox => {
                 let length = self
                     .ending_inline_pbm_stack
                     .pop()
                     .unwrap_or_else(Length::zero);
                 self.add_length(length);
             },
-            InlineFormattingContextIterItem::Item(InlineLevelBox::TextRun(text_run)) => {
+            InlineItem::TextRun(text_run) => {
                 for segment in text_run.shaped_text.iter() {
                     // TODO: This should take account whether or not the first and last character prevent
                     // linebreaks after atomics as in layout.
@@ -2460,7 +2466,7 @@ impl<'a> ContentSizesComputation<'a> {
                     }
                 }
             },
-            InlineFormattingContextIterItem::Item(InlineLevelBox::Atomic(atomic)) => {
+            InlineItem::Atomic(atomic) => {
                 let outer = atomic.outer_inline_content_sizes(
                     self.layout_context,
                     self.containing_block_writing_mode,
@@ -2471,10 +2477,7 @@ impl<'a> ContentSizesComputation<'a> {
                 self.had_content_yet = true;
             },
             _ => {},
-        });
-
-        self.forced_line_break();
-        self.paragraph
+        }
     }
 
     fn add_length(&mut self, l: Length) {
@@ -2520,5 +2523,38 @@ impl<'a> ContentSizesComputation<'a> {
             ending_inline_pbm_stack: Vec::new(),
         }
         .traverse(inline_formatting_context)
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct InlineBoxes {
+    inline_boxes: Vec<ArcRefCell<InlineBox>>,
+}
+
+impl InlineBoxes {
+    pub(super) fn get(&self, identifier: &InlineBoxIdentifier) -> ArcRefCell<InlineBox> {
+        self.inline_boxes[identifier.index].clone()
+    }
+
+    pub(super) fn end_inline_box(&mut self) {}
+
+    pub(super) fn start_inline_box(&mut self, inline_box: InlineBox) -> InlineBoxIdentifier {
+        let identifier = InlineBoxIdentifier {
+            index: self.inline_boxes.len(),
+        };
+
+        self.inline_boxes.push(ArcRefCell::new(inline_box));
+        identifier
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub(crate) struct InlineBoxIdentifier {
+    pub index: usize,
+}
+
+impl InlineBoxIdentifier {
+    fn root() -> Self {
+        InlineBoxIdentifier { index: 0 }
     }
 }

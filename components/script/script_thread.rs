@@ -47,7 +47,7 @@ use devtools_traits::{
 };
 use embedder_traits::EmbedderMsg;
 use euclid::default::{Point2D, Rect};
-use gfx::font_cache_thread::FontCacheThread;
+use fonts::FontCacheThread;
 use headers::{HeaderMapExt, LastModified, ReferrerPolicy as ReferrerPolicyHeader};
 use html5ever::{local_name, namespace_url, ns};
 use hyper_serde::Serde;
@@ -92,7 +92,7 @@ use style::dom::OpaqueNode;
 use style::thread_state::{self, ThreadState};
 use time::precise_time_ns;
 use url::Position;
-use webgpu::WebGPUMsg;
+use webgpu::{WebGPUDevice, WebGPUMsg};
 use webrender_api::DocumentId;
 use webrender_traits::WebRenderScriptApi;
 
@@ -859,6 +859,13 @@ impl ScriptThreadFactory for ScriptThread {
 }
 
 impl ScriptThread {
+    pub fn note_rendering_opportunity(pipeline_id: PipelineId) {
+        SCRIPT_THREAD_ROOT.with(|root| {
+            let script_thread = unsafe { &*root.get().unwrap() };
+            script_thread.rendering_opportunity(pipeline_id);
+        })
+    }
+
     pub fn runtime_handle() -> ParentRuntime {
         SCRIPT_THREAD_ROOT.with(|root| {
             let script_thread = unsafe { &*root.get().unwrap() };
@@ -1692,7 +1699,17 @@ impl ScriptThread {
             // Run the animation frame callbacks.
             document.tick_all_animations();
 
-            // TODO(#31006): Implement the resize observer steps.
+            // Run the resize observer steps.
+            let _realm = enter_realm(&*document);
+            let mut depth = Default::default();
+            while document.gather_active_resize_observations_at_depth(&depth) {
+                // Note: this will reflow the doc.
+                depth = document.broadcast_active_resize_observations();
+            }
+
+            if document.has_skipped_resize_observations() {
+                document.deliver_resize_loop_error_notification();
+            }
 
             // TODO(#31870): Implement step 17: if the focused area of doc is not a focusable area,
             // then run the focusing steps for document's viewport.
@@ -1963,6 +1980,9 @@ impl ScriptThread {
             for document in docs.iter() {
                 let _realm = enter_realm(&**document);
                 document.maybe_queue_document_completion();
+
+                // Document load is a rendering opportunity.
+                ScriptThread::note_rendering_opportunity(document.window().pipeline_id());
             }
             docs.clear();
         }
@@ -2105,7 +2125,7 @@ impl ScriptThread {
                 FocusIFrame(id, ..) => Some(id),
                 WebDriverScriptCommand(id, ..) => Some(id),
                 TickAllAnimations(id, ..) => Some(id),
-                WebFontLoaded(id) => Some(id),
+                WebFontLoaded(id, ..) => Some(id),
                 DispatchIFrameLoadEvent {
                     target: _,
                     parent: id,
@@ -2305,8 +2325,8 @@ impl ScriptThread {
             ConstellationControlMsg::WebDriverScriptCommand(pipeline_id, msg) => {
                 self.handle_webdriver_msg(pipeline_id, msg)
             },
-            ConstellationControlMsg::WebFontLoaded(pipeline_id) => {
-                self.handle_web_font_loaded(pipeline_id)
+            ConstellationControlMsg::WebFontLoaded(pipeline_id, success) => {
+                self.handle_web_font_loaded(pipeline_id, success)
             },
             ConstellationControlMsg::DispatchIFrameLoadEvent {
                 target: browsing_context_id,
@@ -2403,7 +2423,14 @@ impl ScriptThread {
     fn handle_msg_from_webgpu_server(&self, msg: WebGPUMsg) {
         match msg {
             WebGPUMsg::FreeAdapter(id) => self.gpu_id_hub.lock().kill_adapter_id(id),
-            WebGPUMsg::FreeDevice(id) => self.gpu_id_hub.lock().kill_device_id(id),
+            WebGPUMsg::FreeDevice {
+                device_id,
+                pipeline_id,
+            } => {
+                self.gpu_id_hub.lock().kill_device_id(device_id);
+                let global = self.documents.borrow().find_global(pipeline_id).unwrap();
+                global.remove_gpu_device(WebGPUDevice(device_id));
+            },
             WebGPUMsg::FreeBuffer(id) => self.gpu_id_hub.lock().kill_buffer_id(id),
             WebGPUMsg::FreePipelineLayout(id) => self.gpu_id_hub.lock().kill_pipeline_layout_id(id),
             WebGPUMsg::FreeComputePipeline(id) => {
@@ -2423,13 +2450,16 @@ impl ScriptThread {
             WebGPUMsg::FreeRenderPipeline(id) => self.gpu_id_hub.lock().kill_render_pipeline_id(id),
             WebGPUMsg::FreeTexture(id) => self.gpu_id_hub.lock().kill_texture_id(id),
             WebGPUMsg::FreeTextureView(id) => self.gpu_id_hub.lock().kill_texture_view_id(id),
+            WebGPUMsg::FreeComputePass(id) => self.gpu_id_hub.lock().kill_compute_pass_id(id),
             WebGPUMsg::Exit => *self.webgpu_port.borrow_mut() = None,
-            WebGPUMsg::CleanDevice {
+            WebGPUMsg::DeviceLost {
                 pipeline_id,
                 device,
+                reason,
+                msg,
             } => {
                 let global = self.documents.borrow().find_global(pipeline_id).unwrap();
-                global.remove_gpu_device(device);
+                global.gpu_device_lost(device, reason, msg);
             },
             WebGPUMsg::UncapturedError {
                 device,
@@ -3272,7 +3302,7 @@ impl ScriptThread {
     }
 
     /// Handles a Web font being loaded. Does nothing if the page no longer exists.
-    fn handle_web_font_loaded(&self, pipeline_id: PipelineId) {
+    fn handle_web_font_loaded(&self, pipeline_id: PipelineId, _success: bool) {
         let Some(document) = self.documents.borrow().find_document(pipeline_id) else {
             warn!("Web font loaded in closed pipeline {}.", pipeline_id);
             return;
@@ -3281,6 +3311,12 @@ impl ScriptThread {
         // TODO: This should only dirty nodes that are waiting for a web font to finish loading!
         document.dirty_all_nodes();
         document.window().add_pending_reflow();
+
+        // This is required because the handlers added to the promise exposed at
+        // `document.fonts.ready` are run by the event loop only when it performs a microtask
+        // checkpoint. Without the call below, this never happens and the promise is 'stuck' waiting
+        // to be resolved until another event forces a microtask checkpoint.
+        self.rendering_opportunity(pipeline_id);
     }
 
     /// Handles a worklet being loaded. Does nothing if the page no longer exists.

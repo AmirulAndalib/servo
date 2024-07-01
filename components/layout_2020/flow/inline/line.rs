@@ -6,8 +6,7 @@ use std::vec::IntoIter;
 
 use app_units::Au;
 use atomic_refcell::AtomicRef;
-use gfx::font::FontMetrics;
-use gfx::text::glyph::GlyphStore;
+use fonts::{FontMetrics, GlyphStore};
 use servo_arc::Arc;
 use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
 use style::properties::ComputedValues;
@@ -224,10 +223,10 @@ impl TextRunLineItem {
         // The block start of the TextRun is often zero (meaning it has the same font metrics as the
         // inline box's strut), but for children of the inline formatting context root or for
         // fallback fonts that use baseline relatve alignment, it might be different.
-        let start_corner = &LogicalVec2 {
+        let start_corner = LogicalVec2 {
             inline: state.inline_position,
             block: (state.baseline_offset - self.font_metrics.ascent).into(),
-        } - &state.parent_offset;
+        } - state.parent_offset;
 
         let rect = LogicalRect {
             start_corner,
@@ -241,7 +240,7 @@ impl TextRunLineItem {
         Some(TextFragment {
             base: self.base_fragment_info.into(),
             parent_style: self.parent_style,
-            rect,
+            rect: rect.into(),
             font_metrics: self.font_metrics,
             font_key: self.font_key,
             glyphs: self.text,
@@ -284,8 +283,8 @@ impl InlineBoxLineItem {
         state: &mut LineItemLayoutState,
     ) -> Option<BoxFragment> {
         let style = self.style.clone();
-        let mut padding = self.pbm.padding.clone();
-        let mut border = self.pbm.border.clone();
+        let mut padding = self.pbm.padding;
+        let mut border = self.pbm.border;
         let mut margin = self.pbm.margin.auto_is(Au::zero);
 
         if !self.is_first_fragment {
@@ -298,7 +297,7 @@ impl InlineBoxLineItem {
             border.inline_end = Au::zero();
             margin.inline_end = Au::zero();
         }
-        let pbm_sums = &(&padding + &border) + &margin;
+        let pbm_sums = padding + border + margin;
         state.inline_position += pbm_sums.inline_start.into();
 
         let space_above_baseline = self.calculate_space_above_baseline();
@@ -336,7 +335,7 @@ impl InlineBoxLineItem {
             border.inline_end = Au::zero();
             margin.inline_end = Au::zero();
         }
-        let pbm_sums = &(&padding + &border) + &margin.clone();
+        let pbm_sums = padding + border + margin;
 
         // If the inline box didn't have any content at all, don't add a Fragment for it.
         let box_has_padding_border_or_margin = pbm_sums.inline_sum() > Au::zero();
@@ -362,19 +361,20 @@ impl InlineBoxLineItem {
         };
 
         // Make `content_rect` relative to the parent Fragment.
-        content_rect.start_corner = &content_rect.start_corner - &state.parent_offset;
+        content_rect.start_corner -= state.parent_offset;
 
         // Relative adjustment should not affect the rest of line layout, so we can
         // do it right before creating the Fragment.
         if style.clone_position().is_relative() {
-            content_rect.start_corner += &relative_adjustement(&style, state.ifc_containing_block);
+            content_rect.start_corner +=
+                relative_adjustement(&style, state.ifc_containing_block).into();
         }
 
         let mut fragment = BoxFragment::new(
             self.base_fragment_info,
             self.style.clone(),
             fragments,
-            content_rect,
+            content_rect.into(),
             padding,
             border,
             margin,
@@ -444,7 +444,7 @@ impl InlineBoxLineItem {
 
 pub(super) struct AtomicLineItem {
     pub fragment: BoxFragment,
-    pub size: LogicalVec2<Length>,
+    pub size: LogicalVec2<Au>,
     pub positioning_context: Option<PositioningContext>,
 
     /// The block offset of this items' baseline relative to the baseline of the line.
@@ -461,20 +461,19 @@ impl AtomicLineItem {
         // The initial `start_corner` of the Fragment is only the PaddingBorderMargin sum start
         // offset, which is the sum of the start component of the padding, border, and margin.
         // This needs to be added to the calculated block and inline positions.
-        self.fragment.content_rect.start_corner.inline += state.inline_position;
+        self.fragment.content_rect.start_corner.inline += state.inline_position.into();
         self.fragment.content_rect.start_corner.block +=
-            self.calculate_block_start(state.line_metrics);
+            self.calculate_block_start(state.line_metrics).into();
 
         // Make the final result relative to the parent box.
-        self.fragment.content_rect.start_corner =
-            &self.fragment.content_rect.start_corner - &state.parent_offset;
+        self.fragment.content_rect.start_corner -= state.parent_offset.into();
 
         if self.fragment.style.clone_position().is_relative() {
             self.fragment.content_rect.start_corner +=
-                &relative_adjustement(&self.fragment.style, state.ifc_containing_block);
+                relative_adjustement(&self.fragment.style, state.ifc_containing_block);
         }
 
-        state.inline_position += self.size.inline;
+        state.inline_position += self.size.inline.into();
 
         if let Some(mut positioning_context) = self.positioning_context {
             positioning_context.adjust_static_position_of_hoisted_fragments_with_offset(
@@ -493,7 +492,7 @@ impl AtomicLineItem {
         match self.fragment.style.clone_vertical_align() {
             GenericVerticalAlign::Keyword(VerticalAlignKeyword::Top) => Length::zero(),
             GenericVerticalAlign::Keyword(VerticalAlignKeyword::Bottom) => {
-                line_metrics.block_size - self.size.block
+                line_metrics.block_size - self.size.block.into()
             },
 
             // This covers all baseline-relative vertical alignment.
@@ -571,8 +570,7 @@ impl FloatLineItem {
             inline: state.parent_offset.inline,
             block: state.line_metrics.block_offset + state.parent_offset.block,
         };
-        self.fragment.content_rect.start_corner =
-            &self.fragment.content_rect.start_corner - &distance_from_parent_to_ifc;
+        self.fragment.content_rect.start_corner -= distance_from_parent_to_ifc.into();
         self.fragment
     }
 }

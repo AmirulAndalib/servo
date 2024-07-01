@@ -1,10 +1,10 @@
 [package]
 name = "script_layout_interface"
-version = "0.0.1"
-authors = ["The Servo Project Developers"]
-license = "MPL-2.0"
-edition = "2018"
-publish = false
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
 
 [lib]
 name = "script_layout_interface"
@@ -17,8 +17,8 @@ atomic_refcell = { workspace = true }
 canvas_traits = { workspace = true }
 crossbeam-channel = { workspace = true }
 euclid = { workspace = true }
-gfx = { path = "../../gfx" }
-gfx_traits = { workspace = true }
+fonts = { path = "../../fonts" }
+fonts_traits = { workspace = true }
 html5ever = { workspace = true }
 ipc-channel = { workspace = true }
 libc = { workspace = true }

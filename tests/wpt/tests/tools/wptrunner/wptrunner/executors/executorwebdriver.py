@@ -509,7 +509,9 @@ class WebDriverProtocol(Protocol):
             self.logger.debug(message)
         self.webdriver = None
 
-    def is_alive(self):
+    def is_alive(self) -> bool:
+        if not self.webdriver:
+            return False
         try:
             # Get a simple property over the connection, with 2 seconds of timeout
             # that should be more than enough to check if the WebDriver its
@@ -696,6 +698,9 @@ class WebDriverRefTestExecutor(RefTestExecutor):
             """return [window.outerWidth - window.innerWidth,
                        window.outerHeight - window.innerHeight];"""
         )
+        # width_offset and height_offset should never be negative
+        width_offset = max(width_offset, 0)
+        height_offset = max(height_offset, 0)
         try:
             self.protocol.webdriver.window.position = (0, 0)
         except error.InvalidArgumentException:
