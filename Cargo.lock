@@ -4431,9 +4431,9 @@ checksum = "76a49eaebc8750bcba241df1e1e47ebb51b81eb35c65e8f11ffa0aebac353f7f"
 
 [[package]]
 name = "indexmap"
-version = "2.9.0"
+version = "2.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cea70ddb795996207ad57735b50c5982d8844f38ba9ee5f1aedcfb708a2aa11e"
+checksum = "fe4cd85333e22411419a0bcae1297d25e58c9443848b11dc6a86fefe8c78a661"
 dependencies = [
  "equivalent",
  "hashbrown",
@@ -5953,9 +5953,9 @@ checksum = "89d326ae2b2e71f95ca756b7d418c0adcb0018889e73f7eabed59671cb179608"
 
 [[package]]
 name = "ohos-sys-opaque-types"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "463c7a72b9abdef3e78d580284cccbef4b1a4a46588d64f02f68d04030a304b9"
+checksum = "a8e3076cb0f4f6c738a2451ff104551b68358abf5fc3cf068216158a040c6fe7"
 
 [[package]]
 name = "ohos-vsync"
