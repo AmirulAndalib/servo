@@ -519201,7 +519201,7 @@
        []
       ],
       "testharnessreport-servo.js": [
-       "d6616739e6ed63a79e8b2f5d8aee1d5b2ced7f49",
+       "4439393a18125b7232ed4cd5a311faa8664e2edb",
        []
       ],
       "testharnessreport-wktr.js": [
@@ -611775,7 +611775,7 @@
         {}
        ]
       ],
-      "table-limited-quiks.html": [
+      "table-limited-quirks.html": [
        "4deb7a93898aea084b0de1ffcee942ca889e8c9d",
        [
         null,
