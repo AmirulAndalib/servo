@@ -64,7 +64,6 @@ fnv = "1.0"
 fonts_traits = { path = "components/shared/fonts" }
 freetype-sys = "0.20"
 fxhash = "0.2"
-getopts = "0.2.24"
 gleam = "0.15"
 glow = "0.16"
 gstreamer = { version = "0.23", features = ["v1_18"] }
@@ -180,7 +179,7 @@ webxr-api = { path = "components/shared/webxr" }
 wgpu-core = "25"
 wgpu-types = "25"
 winapi = "0.3"
-windows-sys = "0.59"
+windows-sys = "0.61"
 winit = "0.30.12"
 wio = "0.2"
 wr_malloc_size_of = { git = "https://github.com/servo/webrender", branch = "0.67" }
