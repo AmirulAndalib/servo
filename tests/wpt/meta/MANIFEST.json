@@ -382016,6 +382016,21 @@
      ]
     }
    },
+   "trusted-types": {
+    "cjk-string-assignment-to-paragraph.html": [
+     "2c8a1871564376b1edf1d16a55482e6c1913d336",
+     [
+      null,
+      [
+       [
+        "/trusted-types/cjk-string-assignment-to-paragraph-ref.html",
+        "=="
+       ]
+      ],
+      {}
+     ]
+    ]
+   },
    "visual-viewport": {
     "viewport-apply-initial-scale-after-navigation.html": [
      "ec03c380d6d27ed0b486a26203d441dc101fd39f",
@@ -532050,6 +532065,10 @@
     ],
     "WEB_FEATURES.yml": [
      "6ea31f1ef8d3838b3b9d84f6dac839b22083ee20",
+     []
+    ],
+    "cjk-string-assignment-to-paragraph-ref.html": [
+     "52900d746c010c497cdd01cf7ac7415ee94bd3b1",
      []
     ],
     "default-policy-report-only.html.headers": [
@@ -754760,15 +754779,8 @@
          {}
         ]
        ],
-       "input-stepup-weekmonth.html": [
-        "09316b0854077fd36b010185037a17effeae724c",
-        [
-         null,
-         {}
-        ]
-       ],
        "input-stepup.html": [
-        "f6f97eecbe91de16a5cff41405a37c50523d920f",
+        "58573e1485696b88164a67f223a203e39c98a84a",
         [
          null,
          {}
